@@ -167,7 +167,7 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatRequest):
+async def chat_completions(request: ChatRequest, http_request: Request):
     if len(request.messages) == 0:
         raise HTTPException(status_code=400, detail="Messages are required")
     if len(request.messages) > MAX_MESSAGES:
@@ -187,7 +187,11 @@ async def chat_completions(request: ChatRequest):
         if len(msg["content"]) > MAX_CONTENT_CHARS:
             raise HTTPException(status_code=400, detail="Message content too long")
 
+    api_key = http_request.headers.get("X-API-Key", "anonymous")
+    prompt_size = sum(len(msg.get("content", "")) for msg in messages)
+
     last_error: Exception | None = None
+    start_time = time.perf_counter()
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             response = client.chat.completions.create(
@@ -196,10 +200,29 @@ async def chat_completions(request: ChatRequest):
                 stream=False,
                 timeout=REQUEST_TIMEOUT,
             )
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            response_text = response.choices[0].message.content or ""
+            response_size = len(response_text)
+            logger.info(
+                "chat_completions ok api_key=%s model=%s prompt_chars=%s response_chars=%s duration_ms=%s",
+                api_key,
+                request.model,
+                prompt_size,
+                response_size,
+                duration_ms,
+            )
             return response.model_dump()
         except Exception as exc:
             last_error = exc
-            logger.warning("OpenAI request failed on attempt %s: %s", attempt, exc)
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            logger.warning(
+                "chat_completions error api_key=%s model=%s attempt=%s duration_ms=%s err=%s",
+                api_key,
+                request.model,
+                attempt,
+                duration_ms,
+                exc,
+            )
             if attempt < RETRY_ATTEMPTS:
                 time.sleep(RETRY_BACKOFF * attempt)
                 continue
