@@ -1,10 +1,13 @@
 import logging
 import os
 import time
+import uuid
 from collections import defaultdict, deque
 from typing import Deque, Dict, List
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from dotenv import load_dotenv
@@ -19,6 +22,42 @@ if not api_key_env:
 client = OpenAI(api_key=api_key_env)
 
 app = FastAPI()
+
+
+def _error_payload(message: str, error_type: str = "invalid_request_error", code: str | None = None) -> dict:
+    return {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": code,
+        }
+    }
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_payload(detail),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content=_error_payload("Invalid request"),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content=_error_payload("Internal server error", error_type="server_error"),
+    )
 
 log_file = os.getenv("LOG_FILE", "logs/nova_api.log")
 os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -87,10 +126,6 @@ ALLOWED_MODELS = {
     "gpt-4o-mini",
     "gpt-4o",
 }
-ALLOWED_MODELS = {
-    "gpt-4o-mini",
-    "gpt-4o",
-}
 
 _rate_buckets: Dict[str, Deque[float]] = defaultdict(deque)
 
@@ -120,6 +155,16 @@ def _rate_limit_allowed(api_key: str) -> bool:
         return False
     bucket.append(now)
     return True
+
+
+def _normalize_chat_response(payload: dict, model: str) -> dict:
+    payload.setdefault("id", f"chatcmpl-{uuid.uuid4().hex}")
+    payload.setdefault("object", "chat.completion")
+    payload.setdefault("created", int(time.time()))
+    payload.setdefault("model", model)
+    payload.setdefault("choices", [])
+    payload.setdefault("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    return payload
 
 
 @app.middleware("http")
@@ -176,9 +221,6 @@ async def chat_completions(request: ChatRequest, http_request: Request):
     if request.model not in ALLOWED_MODELS:
         raise HTTPException(status_code=400, detail="Unsupported model")
 
-    if request.model not in ALLOWED_MODELS:
-        raise HTTPException(status_code=400, detail="Unsupported model")
-
     messages = [{"role": m.role, "content": m.content} for m in request.messages]
 
     for msg in messages:
@@ -211,7 +253,7 @@ async def chat_completions(request: ChatRequest, http_request: Request):
                 response_size,
                 duration_ms,
             )
-            return response.model_dump()
+            return _normalize_chat_response(response.model_dump(), request.model)
         except Exception as exc:
             last_error = exc
             duration_ms = int((time.perf_counter() - start_time) * 1000)
@@ -231,11 +273,3 @@ async def chat_completions(request: ChatRequest, http_request: Request):
     raise HTTPException(status_code=502, detail="Upstream model error")
 
 
-@app.get("/v1/models")
-async def list_models():
-    return {
-        "data": [
-            {"id": model_id, "object": "model"}
-            for model_id in sorted(ALLOWED_MODELS)
-        ]
-    }
